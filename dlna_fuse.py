@@ -29,20 +29,27 @@
 import errno
 import fuse
 import os
+import signal
 import stat
 import subprocess
-import sys
-import threading
+# import tempfile
+# import threading
 import time
 
 fuse.fuse_python_api = (0, 2)
 
-# The captured video is saved to a temporary file. TODO: Instead of writing
-# to a file, keep some kind of FIFO queue in memory. As the player progresses
-# through the file, throw out old parts of the file that it has already read.
-# For now, storing a temporary file makes things easier to debug and keeps the
-# code simple. 
-TEMP_FILE = os.path.expanduser("~/Videos/live.mkv")
+# # The captured video is saved to a temporary file. TODO: Instead of writing
+# # to a file, keep some kind of FIFO queue in memory. As the player progresses
+# # through the file, throw out old parts of the file that it has already read.
+# # For now, storing a temporary file makes things easier to debug and keeps the
+# # code simple.
+# TEMP_FILE = os.path.expanduser("~/Videos/live.mkv")
+
+FRAME_RATE = "20"
+VIDEO_SIZE = "1024x576"
+X_OFF = "128"
+Y_OFF = "224"
+OTHER_OPTS = ""
 
 class MyStat(fuse.Stat):
     def __init__(self):
@@ -57,81 +64,110 @@ class MyStat(fuse.Stat):
         self.st_mtime = 0
         self.st_ctime = 0
         
-# Producer thread that reads data from a stream, writes it to a file (if given),
-# and notifies other threads via a condition variable.
-class ReadThread(threading.Thread):
-    class Output:
-        def __init__(self, filename):
-            self.outputFile = open(filename, "wb")
-            self.fileSize = 0
-    
-    def __init__(self, process, strm, output, condition):
-        threading.Thread.__init__(self)
-        self.process = process
-        self.strm = strm
-        self.output = output
-        self.condition = condition
-        
-    def run(self):
-        while self.process.poll() is None:
-            data = self.strm.read(4096)
-            if data and self.output:
-                if self.condition:
-                    self.condition.acquire()
-                try:
-                    self.output.outputFile.write(data)
-                    self.output.outputFile.flush()
-                    self.output.fileSize += len(data)
-                    if self.condition:
-                        self.condition.notify_all()
-                finally:
-                    if self.condition:
-                        self.condition.release()
-        print "Process has exited with code", self.process.returncode
-        if self.condition:
-            self.condition.acquire()
-            self.output.fileSize = -1
-            self.condition.notify_all()
-            self.condition.release()
+# # Producer thread that reads data from a stream, writes it to a file (if given),
+# # and notifies other threads via a condition variable.
+# class ReadThread(threading.Thread):
+#     class Output:
+#         def __init__(self):
+#             self.outputFile = tempfile.NamedTemporaryFile("wb", 0, ".mkv")
+#             self.fileSize = 0
+#
+#     def __init__(self, process, strm, output, condition):
+#         threading.Thread.__init__(self)
+#         self.process = process
+#         self.strm = strm
+#         self.output = output
+#         self.condition = condition
+#
+#     def run(self):
+#         while self.process.poll() is None:
+#             data = self.strm.read(4096)
+#             if data and self.output:
+#                 if self.condition:
+#                     self.condition.acquire()
+#                 try:
+#                     self.output.outputFile.write(data)
+#                     self.output.outputFile.flush()
+#                     self.output.fileSize += len(data)
+#                     if self.condition:
+#                         self.condition.notify_all()
+#                 finally:
+#                     if self.condition:
+#                         self.condition.release()
+#         print "Process has exited with code", self.process.returncode
+#         if self.condition:
+#             self.condition.acquire()
+#             self.output.fileSize = -1
+#             self.condition.notify_all()
+#             self.condition.release()
 
 class DlnaFuse(fuse.Fuse):
     def __init__(self, *args, **kw):
         fuse.Fuse.__init__(self, *args, **kw)
 
-        self.output = ReadThread.Output(TEMP_FILE)
-        self.hasMoreData = threading.Condition()
-        
-        pulseaudio_monitor = os.popen("pactl list | grep -A2 '^Source #' "
-            " | grep 'Name: .*\.monitor$' | awk '{print $NF}' | tail -n1").read().strip()
-            
-        print "Using PulseAudio monitor", pulseaudio_monitor
-        
-        live_filter = os.path.abspath(os.path.join(os.getcwd(), "matroska_live_filter.py"))
+        # self.output = ReadThread.Output()
+        # self.hasMoreData = threading.Condition()
+        self.refcnt = 0
 
-        cmd = ("parec -d %(pulseaudio_monitor)s"
-            " | ffmpeg -f s16le -ac 2 -ar 44100 -i - -f x11grab -r 20 -s 1024x576"
-            " -i :0.0+128,224 -acodec ac3 -ac 1 -vcodec libx264 -vpre fast"
-            " -threads 0 -f matroska - "
-            " | %(live_filter)s - ") % locals()
-            
-        print "Running capture command:", cmd
-        self.process = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                        stderr=subprocess.PIPE,
-                                        shell=True)
-        
-        t = ReadThread(self.process, self.process.stdout,
-                       self.output, self.hasMoreData)
-        t.setDaemon(True)
-        t.start()
+    def open(self, path, flags):
+        print "open", path, "%x"%flags
+        accmode = os.O_RDONLY | os.O_WRONLY | os.O_RDWR
+        if (flags & accmode) != os.O_RDONLY:
+            return -errno.EACCES
 
-        stderr_thrd = ReadThread(self.process, self.process.stderr, None, None)
-        stderr_thrd.setDaemon(True)
-        stderr_thrd.start()
+        if self.refcnt == 0:
+            pulseaudio_monitor = os.popen("pactl list | grep -A2 '^Source #'"
+                " | grep 'Name: .*\.monitor$' | awk '{print $NF}'"
+                " | tail -n1").read().strip()
 
-        # Read some data so that it's ready immediately when the player requests
-        # it (my player appears to have a short timeout and gives up when it
-        # has to wait too long for the metadata).        
-        self.read("", 1024 * 1024, 0)
+            print "Using PulseAudio monitor", pulseaudio_monitor
+
+            live_filter = os.path.abspath(os.path.join(os.path.dirname(__file__),
+                "matroska_live_filter.py"))
+
+            cmd = ("parec -d %(pulseaudio_monitor)s | ffmpeg -f s16le -ac 2"
+                " -ar 44100 -i - -f x11grab -r "+FRAME_RATE+" -s "+VIDEO_SIZE+
+                " "+OTHER_OPTS+" -i :0.0+"+X_OFF+","+Y_OFF+" -acodec ac3 -ac 1"
+                " -vcodec libx264 -preset fast -pix_fmt yuv420p -threads 0"
+                " -f matroska - 2> /dev/null #| %(live_filter)s - 2> /dev/null"
+                ) % locals()
+
+            print "Running capture command:", cmd
+            self.process = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                            # stderr=subprocess.PIPE,
+                                            shell=True)
+
+            # t = ReadThread(self.process, self.process.stdout,
+            #                self.output, self.hasMoreData)
+            # t.setDaemon(True)
+            # t.start()
+            #
+            # stderr_thrd = ReadThread(self.process, self.process.stderr, None,
+            #                                                             None)
+            # stderr_thrd.setDaemon(True)
+            # stderr_thrd.start()
+            #
+            # # Read some data so that it's ready immediately when the player requests
+            # # it (my player appears to have a short timeout and gives up when it
+            # # has to wait too long for the metadata).
+            # self.read("", 1024 * 1024, 0)
+        self.refcnt += 1
+        print "The refcnt is now", self.refcnt
+
+        # st = fuse.FuseFileInfo()
+        # setattr(st, "keep_cache", False)
+        # setattr(st, "direct_io", True)
+        # return st
+
+    def release(self, path, flags):
+        print "release", path, "%x"%flags
+        self.refcnt -= 1
+        if self.refcnt == 0:
+            while self.process.poll() == None:
+                saved_handler = signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                os.killpg(os.getpgrp(), signal.SIGTERM)
+                signal.signal(signal.SIGTERM, saved_handler)
+        print "The refcnt is now", self.refcnt
 
     def getattr(self, path):
         print "getattr", path
@@ -172,27 +208,28 @@ class DlnaFuse(fuse.Fuse):
 
     def read(self, path, size, offset):
         print "read", path, size, offset
-        neededSize = offset + size
-        self.hasMoreData.acquire()
-        try: 
-            while self.output.fileSize < neededSize + 4096:
-                if self.output.fileSize == -1:
-                    print "Capture thread has exited"
-                    return ""
-                # If the player reads more than 10 MB ahead, this is probably
-                # an error. We cannot satisfy the request without waiting a
-                # (potentially) long time for the data to accumulate.
-                if neededSize > self.output.fileSize + 10 * 1024 * 1024:
-                    print "!!!! seeking 10MB ahead; signaling end of file"
-                    return ""
-                print "need to wait for file size", neededSize, "have", self.output.fileSize
-                self.hasMoreData.wait()
-            f = open(TEMP_FILE, "rb")
-            f.seek(offset, 0)
-            data = f.read(size)
-        finally:
-            self.hasMoreData.release()
-        return data
+        # neededSize = offset + size
+        # self.hasMoreData.acquire()
+        # try:
+        #     while self.output.fileSize < neededSize + 4096:
+        #         if self.output.fileSize == -1:
+        #             print "Capture thread has exited"
+        #             return ""
+        #         # If the player reads more than 10 MB ahead, this is probably
+        #         # an error. We cannot satisfy the request without waiting a
+        #         # (potentially) long time for the data to accumulate.
+        #         if neededSize > self.output.fileSize + 10 * 1024 * 1024:
+        #             print "!!!! seeking 10MB ahead; signaling end of file"
+        #             return ""
+        #         print "need to wait for file size", neededSize, "have", self.output.fileSize
+        #         self.hasMoreData.wait()
+        #     f = open(self.output.outputFile.name, "rb", 0)
+        #     f.seek(offset, 0)
+        #     data = f.read(size)
+        # finally:
+        #     self.hasMoreData.release()
+        # return data
+        return self.process.stdout.read(size)
 
 def main():
     server = DlnaFuse(version="%prog " + fuse.__version__,
@@ -200,7 +237,9 @@ def main():
                             "to start live desktop capture",
                       dash_s_do="setsingle")
     server.parse(errex=1)
+    old_handler = signal.signal(signal.SIGINT, signal.SIG_DFL)
     server.main()
+    signal.signal(signal.SIGINT, old_handler)
 
 if __name__ == "__main__":
     main()
